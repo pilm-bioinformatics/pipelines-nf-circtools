@@ -150,7 +150,7 @@ ch_output_docs = Channel.fromPath("$baseDir/docs/output.md")
 /*
  * Create a channel for input read files
  */
- f(!params.singleEnd) { exit 1, "Only singleEnd supported!" }
+ if(!params.singleEnd) { exit 1, "Only singleEnd supported!" }
  
 if(params.readPaths){
     if(params.singleEnd){
@@ -245,10 +245,10 @@ process get_software_versions {
     """
     echo $workflow.manifest.version &> v_ngi_rnaseq.txt
     echo $workflow.nextflow.version &> v_nextflow.txt
-    fastqc --version &> v_fastqc.txt
-    STAR --version &> v_star.txt
-    samtools --version &> v_samtools.txt
-    multiqc --version &> v_multiqc.txt
+    fastqc --version &> v_fastqc.txt  || true
+    STAR --version &> v_star.txt  || true
+    samtools --version &> v_samtools.txt  || true
+    multiqc --version &> v_multiqc.txt  || true
     scrape_software_versions.py &> software_versions_mqc.yaml
     """
 }
@@ -256,7 +256,7 @@ process get_software_versions {
 /*
  * PREPROCESSING - Build STAR index
  */
-if(params.aligner == 'star' && !params.star_index && params.fasta){
+if(!params.star_index && params.fasta){
     process makeSTARindex {
         label 'high_memory'
         tag "$fasta"
@@ -286,23 +286,22 @@ if(params.aligner == 'star' && !params.star_index && params.fasta){
 }
 
 
-if(params.rrna){
-  process index {
-      tag "$rrna.simpleName"
-      publishDir path: { "${params.outdir}" },
-                 mode: 'copy'
+process makeRRNAindex {
+    tag "$rrna.simpleName"
+    publishDir path: { "${params.outdir}" },
+               mode: 'copy'
 
-      input:
-      file rrna from tx_rrna_ch
+    input:
+    file rrna from tx_rrna_ch
 
-      output:
-      file 'rrna_index' into rrna_index_ch
+    output:
+    file 'rrna_index' into rrna_index_ch
 
-      script:
-      """
-      bowtie2 index --threads $task.cpus -t $rrna -i rrna_index
-      """
-  }
+    script:
+    """
+    mkdir rrna_index
+    bowtie2-build --threads $task.cpus $rrna rrna_index/rrna
+    """
 }
 
 
@@ -336,28 +335,20 @@ process fastqc {
 process trim {
     label 'low_memory'
     tag "$name"
-    publishDir "${params.outdir}/trimmed", mode: 'copy'}
+    publishDir "${params.outdir}/trimmed", mode: 'copy'
 
     input:
     set val(name), file(reads) from raw_reads_trim
-    file wherearemyfiles from ch_where_trim_galore.collect()
 
     output:
-    file "*fq.gz" into trimmed_reads
-    file "*.log" into trimmed_logs
+    file "*_trimmed.fq.gz" into trimmed_reads
+    file "*.txt" into trimmed_logs
 
     script:
-    if (params.singleEnd) {
-        """
-        flexbar -r $reads -t $name -n 1 -z GZ -m 30 -u 0 -q TAIL -qt 28 -as AGATCGGAAGAG -qf sanger -j
-
-        """
-    } else {
-        """
-        flexbar -r $reads -t trimmed -n 1 -z GZ -m 30 -u 0 -q TAIL -qt 28 -as AGATCGGAAGAG -qf sanger -j
-
-        """
-    }
+    """
+    # flexbar -r $reads -t $name -n 1 -z GZ -m 30 -u 0 -q TAIL -qt 28 -as AGATCGGAAGAG -qf sanger -j
+    trim_galore --gzip $reads --trim-n -a AGATCGGAAGAG -q 28 --polyA
+    """
 }
 
 
@@ -366,20 +357,21 @@ process rrna {
     publishDir "${params.outdir}/rrna", mode: 'copy'
 
     input:
-    file index from rrna_index_ch.collect()
+    file rrna_index from rrna_index_ch.collect()
     file reads from trimmed_reads
 
     output:
-    "*fastq.gz" into clean_ch
+    file "*_clean.fastq.gz" into clean_ch
     
     script:
+    prefix = reads[0].toString() - ~/(_trimmed)?(\.fq)?(\.gz)?$/
     if (params.singleEnd){
         """
-        bowtie2 -x $rrna_index -U $reads -S $index --no-unal --omit-sec-seq --threads ${task.cpus} --mm --seed 1337 --time $sample.fastq.gz 2> $sample.log
+        bowtie2 -x $rrna_index/rrna -U $reads  --no-unal --omit-sec-seq --threads ${task.cpus} --mm --seed 1337 --un-gz ${prefix}_clean.fastq.gz --time -S ${prefix}.sam 2> ${prefix}.log
         """
     }else{
         """
-        bowtie2 -x $rrna_index -1 $reads -2  $trimmed -S rrna/sample1.sam --no-unal --omit-sec-seq --threads ${task.cpus} --mm --seed 1337 --time --un-conc-gz rrna/sample1.fastq.gz 2> rrna/sample1.log
+        bowtie2 -x $rrna_index -1 $reads[0] -2 $reads[1] -S ${reads.baseName}.sam --no-unal --omit-sec-seq --threads ${task.cpus} --mm --seed 1337 --time --un-conc-gz ${reads.baseName}.fastq.gz 2> ${reads.baseName}.log
 
         """
     }
@@ -391,67 +383,64 @@ process rrna {
  */
 // Function that checks the alignment rate of the STAR output
 // and returns true if the alignment passed and otherwise false
-    process star {
-        label 'high_memory'
-        tag "$prefix"
-        publishDir "${params.outdir}/STAR", mode: 'copy',
-            saveAs: {filename ->
-                if (filename.indexOf(".bam") == -1) "logs/$filename"
-                else null
-            }
+  process star {
+      label 'high_memory'
+      tag "${reads.baseName}"
+      publishDir "${params.outdir}/STAR", mode: 'copy',
+          saveAs: {filename ->
+              if (filename.indexOf(".bam") == -1) "logs/$filename"
+              else "$filename"
+          }
 
-        input:
-        file reads from trimmed_reads
-        file index from star_index.collect()
-        file gtf from gtf_star.collect()
+      input:
+      file reads from clean_ch
+      file index from star_index.collect()
+      file gtf from gtf_star.collect()
 
-        output:
-        set file("*Log.final.out"), file ('*.bam') into star_aligned
-        file "*.out" into alignment_logs
-        file "*SJ.out.tab"
-        file "*Log.out" into star_log
-        file  "*Chimeric.out.junction" into circtools_ch
-        file "where_are_my_files.txt"
-        file "${prefix}Aligned.sortedByCoord.out.bam.bai" into bam_index
+      output:
+      file("*Log.final.out") into bam_log
+      file ('*.bam') into bam_ch
+      file "*.out" into alignment_logs
+      file "*SJ.out.tab"
+      file "*Log.out" into star_log
+      file  "*Chimeric.out.junction" into circtools_ch
 
-        script:
-        prefix = reads[0].toString() - ~/(_R1)?(_trimmed)?(_val_1)?(\.fq)?(\.fastq)?(\.gz)?$/
-        def star_mem = task.memory ?: params.star_memory ?: false
-        def avail_mem = star_mem ? "--limitBAMsortRAM ${star_mem.toBytes() - 100000000}" : ''
-        """
-        mkdir -p $prefix
-        STAR	--runThreadN ${task.cpus}\\
-        	--genomeDir $index \\
-        	--genomeLoad NoSharedMemory\\
-        	--readFilesIn $prefix\\
-        	--readFilesCommand zcat\\
-        	--outFileNamePrefix $sample\\
-        	--outReadsUnmapped Fastx\\
-        	--outSAMattributes NH   HI   AS   nM   NM   MD   jM   jI   XS\\
-        	--outSJfilterOverhangMin 15   15   15   15\\
-        	--outFilterMultimapNmax 20\\
-        	--outFilterScoreMin 1\\
-        	--outFilterMatchNminOverLread 0.7\\
-        	--outFilterMismatchNmax 999\\
-        	--outFilterMismatchNoverLmax 0.05\\
-        	--alignIntronMin 20\\
-        	--alignIntronMax 1000000\\
-        	--alignMatesGapMax 1000000\\
-        	--alignSJoverhangMin 15\\
-        	--alignSJDBoverhangMin 10\\
-        	--alignSoftClipAtReferenceEnds No\\
-        	--chimSegmentMin 15\\
-        	--chimScoreMin 15\\
-        	--chimScoreSeparation 10\\
-        	--chimJunctionOverhangMin 15\\
-        	--sjdbGTFfile $gtf \\
-        	--quantMode GeneCounts\\
-        	--twopassMode Basic\\
-        	--chimOutType Junctions SeparateSAMold \\
-          --outSAMtype BAM SortedByCoordinate $avail_mem \\
-          --outFileNamePrefix $prefix 
-        """
-    }
+      script:
+      prefix = reads[0].toString() - ~/(_clean)?(\.fastq)?(\.gz)?$/
+      def avail_mem = task.memory ? "--limitGenomeGenerateRAM ${task.memory.toBytes() - 100000000}" : ''
+      """
+      mkdir -p $prefix
+      STAR	--runThreadN ${task.cpus}\\
+      	--genomeDir $index \\
+      	--genomeLoad NoSharedMemory\\
+      	--readFilesIn $reads\\
+      	--readFilesCommand zcat\\
+      	--outFileNamePrefix $prefix\\
+      	--outReadsUnmapped Fastx\\
+      	--outSAMattributes NH   HI   AS   nM   NM   MD   jM   jI   XS\\
+      	--outSJfilterOverhangMin 15   15   15   15\\
+      	--outFilterMultimapNmax 20\\
+      	--outFilterScoreMin 1\\
+      	--outFilterMatchNminOverLread 0.7\\
+      	--outFilterMismatchNmax 999\\
+      	--outFilterMismatchNoverLmax 0.05\\
+      	--alignIntronMin 20\\
+      	--alignIntronMax 1000000\\
+      	--alignMatesGapMax 1000000\\
+      	--alignSJoverhangMin 15\\
+      	--alignSJDBoverhangMin 10\\
+      	--alignSoftClipAtReferenceEnds No\\
+      	--chimSegmentMin 15\\
+      	--chimScoreMin 15\\
+      	--chimScoreSeparation 10\\
+      	--chimJunctionOverhangMin 15\\
+      	--sjdbGTFfile $gtf \\
+      	--quantMode GeneCounts\\
+      	--twopassMode Basic\\
+      	--chimOutType Junctions SeparateSAMold \\
+        --outSAMtype BAM SortedByCoordinate $avail_mem
+      """
+  }
 
 
 
@@ -460,59 +449,26 @@ process circtools {
     publishDir "${params.outdir}/circtools", mode: 'copy'
 
     input:
-    file reads from circtools_ch
+    file samples from circtools_ch.collect()
+    file bams from bam_ch.collect()
     file gtf from gtf_circtools.collect()
     file repeat from repeat_ch.collect()
     file genome from ch_fasta_for_circtools.collect()
 
     output:
-    "prefix" into circtools_out
+    file "*.circRNA" into circtools_out
+    file "*.circRNAmapped" into circtools_mapped_out
+    file "CircRNACount" into rnacount
+    file "CircCoordinates" into coordinates
     
     script:
-    if (params.singleEnd){
-        """
-        circtools detect star/sample1/Chimeric.out.junction -D -F -M -Nr 2 1 -fg -G -R $repeat -an $gtf -A $genome
-        """
-    }else{
-        """
-        circtools detect star/sample1/Chimeric.out.junction -D -Pi -F -M -Nr 2 1 -fg -G -R $repeat -an $gtf -A $genome
-        """
-    }
-}
-
-
-/*
- * STEP 7 - Qualimap
- */
-process qualimap {
-    label 'low_memory'
-    tag "${bam.baseName}"
-    publishDir "${params.outdir}/qualimap", mode: 'copy'
-
-    when:
-    !params.skip_qc && !params.skip_qualimap
-
-    input:
-    file bam from bam_qualimap
-    file gtf from gtf_qualimap.collect()
-
-    output:
-    file "${bam.baseName}" into qualimap_results
-
-    script:
-    def qualimap_direction = 'non-strand-specific'
-    if (forward_stranded){
-        qualimap_direction = 'strand-specific-forward'
-    }else if (reverse_stranded){
-        qualimap_direction = 'strand-specific-reverse'
-    }
-    def paired = params.singleEnd ? '' : '-pe'
-    memory = task.memory.toGiga() + "G"
     """
-    unset DISPLAY
-    qualimap --java-mem-size=${memory} rnaseq $qualimap_direction $paired -s -bam $bam -gtf $gtf -outdir ${bam.baseName}
+    circtools detect $samples -B $bams -D -F -M -Nr 5 1 -fg -G -R $repeat -an $gtf -A $genome
+  
+    # circtools detect $samples -D -Pi -F -M -Nr 5 1 -fg -G -R $repeat -an $gtf -A $genome
     """
 }
+
 
 /*
  * STEP 13 - MultiQC
@@ -526,9 +482,8 @@ process multiqc {
     input:
     file multiqc_config from ch_multiqc_config
     file (fastqc:'fastqc/*') from fastqc_results.collect().ifEmpty([])
-    file ('trim/*') from trim_results.collect()
+    file ('trim/*') from trimmed_logs.collect()
     file ('alignment/*') from alignment_logs.collect()
-    file ('qualimap/*') from qualimap_results.collect().ifEmpty([])
     file ('software_versions/*') from software_versions_yaml
     file workflow_summary from create_workflow_summary(summary)
 
@@ -542,7 +497,7 @@ process multiqc {
     rfilename = custom_runName ? "--filename " + custom_runName.replaceAll('\\W','_').replaceAll('_+','_') + "_multiqc_report" : ''
     """
     multiqc . -f $rtitle $rfilename --config $multiqc_config \\
-        -m custom_content -m picard -m preseq -m rseqc -m featureCounts -m hisat2 -m star -m cutadapt -m fastqc -m qualimap
+        -m custom_content -m star -m cutadapt -m fastqc
     """
 }
 
@@ -552,6 +507,9 @@ process multiqc {
 process output_documentation {
     publishDir "${params.outdir}/pipeline_info", mode: 'copy'
 
+    when:
+    false 
+    
     input:
     file output_docs from ch_output_docs
 
@@ -573,9 +531,6 @@ workflow.onComplete {
 
     // Set up the e-mail variables
     def subject = "[nf-core/rnaseq] Successful: $workflow.runName"
-    if(skipped_poor_alignment.size() > 0){
-        subject = "[nf-core/rnaseq] Partially Successful (${skipped_poor_alignment.size()} skipped): $workflow.runName"
-    }
     if(!workflow.success){
       subject = "[nf-core/rnaseq] FAILED: $workflow.runName"
     }
@@ -607,7 +562,7 @@ workflow.onComplete {
     // On success try attach the multiqc report
     def mqc_report = null
     try {
-        if (workflow.success && !params.skip_multiqc) {
+        if (workflow.success && !parlams.skip_multiqc) {
             mqc_report = multiqc_report.getVal()
             if (mqc_report.getClass() == ArrayList){
                 log.warn "[nf-core/rnaseq] Found multiple reports from process 'multiqc', will use only one"
