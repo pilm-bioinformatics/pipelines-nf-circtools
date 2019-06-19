@@ -9,19 +9,6 @@
 */
 
 def helpMessage() {
-    log.info nfcoreHeader()
-    log.info """
-=======
-                         nf-core/circrna
-========================================================================================
- nf-core/circrna Analysis Pipeline.
- #### Homepage / Documentation
-https://github.com/pilm-bioinformatics/piplines-nf-circtools
-----------------------------------------------------------------------------------------
-*/
-
-
-def helpMessage() {
     // TODO nf-core: Add to this help message with new command line parameters
     log.info nfcoreHeader()
     log.info"""
