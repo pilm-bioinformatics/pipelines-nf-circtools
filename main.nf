@@ -66,12 +66,6 @@ if (params.genomes && params.genome && !params.genomes.containsKey(params.genome
     exit 1, "The provided genome '${params.genome}' is not available in the iGenomes file. Currently the available genomes are ${params.genomes.keySet().join(", ")}"
 }
 
-// Reference index path configuration
-// Define these here - after the profiles are loaded with the iGenomes paths
-params.star_index = params.genome ? params.genomes[ params.genome ].star ?: false : false
-params.fasta = params.genome ? params.genomes[ params.genome ].fasta ?: false : false
-params.gtf = params.genome ? params.genomes[ params.genome ].gtf ?: false : false
-
 
 Channel.fromPath("$baseDir/assets/where_are_my_files.txt")
        .into{ch_where_trim_galore; ch_where_star; }
@@ -81,18 +75,18 @@ reverse_stranded = params.reverse_stranded
 unstranded = params.unstranded
 
 
-if( params.star_index && params.aligner == 'star' ){
+if( params.star_index ){
     star_index = Channel
         .fromPath(params.star_index)
         .ifEmpty { exit 1, "STAR index not found: ${params.star_index}" }
 }
-else if ( params.fasta ){
+else if ( !params.fasta ) {
+    exit 1, "No reference genome specified!"
+}
+if ( params.fasta ){
     Channel.fromPath(params.fasta)
            .ifEmpty { exit 1, "Fasta file not found: ${params.fasta}" }
            .into { ch_fasta_for_star_index; ch_fasta_for_circtools}
-}
-else {
-    exit 1, "No reference genome specified!"
 }
 
 if( params.gtf ){
@@ -107,12 +101,12 @@ if( params.gtf ){
 
 Channel
     .fromPath(params.rrna)
-    .ifEmpty { exit 1, "Transcript fasta file is unreachable: ${params.rrna}"  }
+    .ifEmpty { exit 1, "rrna FASTA file is unreachable: ${params.rrna}"  }
     .set { tx_rrna_ch  }
 
 Channel
     .fromPath(params.repeat)
-    .ifEmpty { exit 1, "GTF fasta file is unreachable: ${params.repeat}"  }
+    .ifEmpty { exit 1, "repeat GTF fasta file is unreachable: ${params.repeat}"  }
     .set { repeat_ch  }
 
 // Has the run name been specified by the user?
@@ -341,6 +335,7 @@ process trim {
 
 process rrna {
     tag "$sample"
+    label 'low_memory'
     publishDir "${params.outdir}/rrna", mode: 'copy'
 
     input:
@@ -433,6 +428,7 @@ process rrna {
 
 process circtools {
     tag "$sample"
+    label 'low_memory'
     publishDir "${params.outdir}/circtools", mode: 'copy'
 
     input:
@@ -450,7 +446,7 @@ process circtools {
     
     script:
     """
-    circtools detect $samples -B $bams -D -F -M -Nr 5 1 -fg -G -R $repeat -an $gtf -A $genome
+    circtools detect $samples -B $bams -D -F -M -Nr 2 1 -fg -G -R $repeat -an $gtf -A $genome
   
     # circtools detect $samples -D -Pi -F -M -Nr 5 1 -fg -G -R $repeat -an $gtf -A $genome
     """
